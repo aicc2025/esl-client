@@ -27,3 +27,27 @@ dependencies {
 tasks.named('test') {
     useJUnitPlatform()
 }
+
+task runReconnectionTest(type: JavaExec) {
+    description = 'Run manual reconnection test'
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'ReconnectionManualTest'
+    standardInput = System.in
+}
+
+task runOutboundTest(type: JavaExec) {
+    description = 'Run manual outbound test'
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'OutboundManualTest'
+    standardInput = System.in
+}
+
+task runOutboundExecuteTest(type: JavaExec) {
+    description = 'Run outbound test with Execute API'
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'OutboundExecuteTest'
+    standardInput = System.in
+}

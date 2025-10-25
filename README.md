@@ -44,6 +44,9 @@ public class InboundExample {
         // Create client (uses virtual threads internally)
         Client client = new Client();
 
+        // Reconnection is enabled by default
+        // To disable: client.setReconnectable(false);
+
         // Add event listener
         client.addEventListener((ctx, event) -> {
             System.out.println("Event: " + event.getEventName());
@@ -61,197 +64,16 @@ public class InboundExample {
 }
 ```
 
-### Filtered Event Listeners
-
-Subscribe to specific event types only (client-side filtering):
-
-```java
-import org.freeswitch.esl.client.inbound.Client;
-import org.freeswitch.esl.client.internal.IModEslApi.EventFormat;
-
-import java.net.InetSocketAddress;
-
-public class FilteredListenerExample {
-    public static void main(String[] args) throws Exception {
-        Client client = new Client();
-
-        // Listen only to channel creation events
-        client.addEventListener((ctx, event) -> {
-            System.out.println("Channel created: " + event.getEventHeaders().get("Unique-ID"));
-        }, "CHANNEL_CREATE");
-
-        // Listen only to hangup events
-        client.addEventListener((ctx, event) -> {
-            System.out.println("Channel hung up: " + event.getEventHeaders().get("Unique-ID"));
-        }, "CHANNEL_HANGUP");
-
-        // Global listener receives all events
-        client.addEventListener((ctx, event) -> {
-            System.out.println("All events: " + event.getEventName());
-        });
-
-        // Connect and subscribe
-        client.connect(new InetSocketAddress("localhost", 8021), "ClueCon", 10);
-        client.setEventSubscriptions(EventFormat.PLAIN, "all");
-
-        // Remove a specific listener when done
-        // client.removeEventListener(listener);
-
-        Thread.currentThread().join();
-    }
-}
-```
-
-### Automatic Server Subscription Optimization
-
-Enable automatic server-side filtering to reduce network bandwidth:
-
-```java
-import org.freeswitch.esl.client.inbound.Client;
-
-import java.net.InetSocketAddress;
-
-public class AutoOptimizationExample {
-    public static void main(String[] args) throws Exception {
-        Client client = new Client();
-
-        // Enable automatic server subscription optimization
-        client.setAutoUpdateServerSubscription(true);
-
-        // Connect to FreeSWITCH
-        client.connect(new InetSocketAddress("localhost", 8021), "ClueCon", 10);
-
-        // Add filtered listeners
-        client.addEventListener((ctx, event) -> {
-            System.out.println("Channel created");
-        }, "CHANNEL_CREATE");
-        // Auto-sends: event plain CHANNEL_CREATE
-
-        client.addEventListener((ctx, event) -> {
-            System.out.println("Channel hangup");
-        }, "CHANNEL_HANGUP");
-        // Auto-sends: event plain CHANNEL_CREATE CHANNEL_HANGUP
-
-        // Add global listener
-        client.addEventListener((ctx, event) -> {
-            System.out.println("All events");
-        });
-        // Auto-sends: event plain all
-
-        // Remove global listener
-        client.removeEventListener(globalListener);
-        // Auto-sends: event plain CHANNEL_CREATE CHANNEL_HANGUP
-
-        Thread.currentThread().join();
-    }
-}
-```
-
-**How it works:**
-- Calculates the union of all listener event filters
-- If any global listener exists (no filter) → subscribes to "all"
-- Otherwise → subscribes only to events that listeners need
-- Automatically updates when listeners are added/removed
-- Reduces network traffic from FreeSWITCH
-
-### Automatic Reconnection with Heartbeat Monitoring
-
-Production-ready client with automatic reconnection on connection failure:
-
-```java
-import org.freeswitch.esl.client.inbound.ReconnectableClient;
-import org.freeswitch.esl.client.inbound.ReconnectionConfig;
-import org.freeswitch.esl.client.internal.IModEslApi.EventFormat;
-
-import java.net.InetSocketAddress;
-
-public class ReconnectableExample {
-    public static void main(String[] args) throws Exception {
-        // Create reconnectable client with default config
-        // Default: 60s heartbeat timeout, 10s health check, exponential backoff
-        ReconnectableClient client = new ReconnectableClient();
-
-        // Or use custom configuration
-        ReconnectionConfig config = new ReconnectionConfig();
-        config.setHeartbeatTimeoutMs(40_000);  // 40 seconds (fast detection)
-        config.setHealthCheckIntervalMs(10_000); // Check every 10 seconds
-        // ReconnectableClient client = new ReconnectableClient(config);
-
-        // Or use preset configurations
-        // ReconnectableClient client = new ReconnectableClient(ReconnectionConfig.fastDetection());
-        // ReconnectableClient client = new ReconnectableClient(ReconnectionConfig.tolerant());
-
-        // Add business event listeners (preserved across reconnections)
-        client.addEventListener((ctx, event) -> {
-            System.out.println("Channel created: " + event.getEventHeaders().get("Unique-ID"));
-        }, "CHANNEL_CREATE");
-
-        client.addEventListener((ctx, event) -> {
-            System.out.println("Channel hung up");
-        }, "CHANNEL_HANGUP");
-
-        // Connect (automatically subscribes to HEARTBEAT internally)
-        client.connect(new InetSocketAddress("localhost", 8021), "ClueCon", 10);
-
-        // Set business event subscriptions (preserved across reconnections)
-        client.setEventSubscriptions(EventFormat.PLAIN, "CHANNEL_CREATE CHANNEL_HANGUP");
-
-        // Client will automatically:
-        // - Monitor HEARTBEAT events (FreeSWITCH sends every 20 seconds)
-        // - Detect connection failures (no heartbeat for 60 seconds)
-        // - Reconnect with exponential backoff (1s, 2s, 4s, 8s, ... up to 60s)
-        // - Restore all listeners and subscriptions after reconnection
-
-        Thread.currentThread().join();
-    }
-}
-```
-
-**Features:**
-- **HEARTBEAT Monitoring**: Tracks FreeSWITCH HEARTBEAT events (sent every 20 seconds)
-- **Automatic Detection**: Detects connection failures when heartbeat timeout is exceeded
-- **Exponential Backoff**: Retries with increasing delays (1s → 2s → 4s → 8s → ... → 60s max)
-- **Jitter**: Adds randomization (±10%) to prevent thundering herd
-- **State Preservation**: Automatically restores listeners and subscriptions after reconnection
-- **Virtual Threads**: All background tasks use lightweight virtual threads
-
-**Configuration Options:**
-
-| Parameter | Default | Fast Detection | Tolerant | Description |
-|-----------|---------|----------------|----------|-------------|
-| Heartbeat Timeout | 60s (3x) | 40s (2x) | 90s (4.5x) | Max time without heartbeat before reconnecting |
-| Health Check Interval | 10s | 10s | 15s | How often to check for timeout |
-| Initial Reconnect Delay | 1s | 500ms | 1s | First retry delay |
-| Max Reconnect Delay | 60s | 60s | 120s | Maximum retry delay |
-| Reconnect Multiplier | 2.0 | 2.0 | 2.0 | Exponential backoff multiplier |
-| Jitter Factor | 0.2 (±10%) | 0.2 | 0.2 | Randomization to avoid thundering herd |
-
-**How it works:**
-```
-FreeSWITCH HEARTBEAT:  0s    20s    40s    60s    80s    100s
-                       ↓     ↓      ↓      ✗      ✗      ✗
-Client receives:       ✓     ✓      ✓
-                             ↑                           ↑
-                       lastHeartbeat              Timeout detected
-                       (40s)                      (100s - 40s = 60s)
-
-Health Check (10s):    10s   20s    30s    40s    50s    60s    70s    80s    90s    100s
-                       ✓     ✓      ✓      ✓      ✓      ✓      ✓      ✓      ✓      ✗
-                                                                                     Triggers
-                                                                                     Reconnect
-
-Reconnection Attempts: Wait 1s → Attempt 1 → Fail → Wait 2s → Attempt 2 → Fail → Wait 4s → Attempt 3 → Success
-                                                              Exponential backoff with jitter
-```
-
 ### Outbound Connection (Server Mode)
 
-Accept connections from FreeSWITCH:
+Accept connections from FreeSWITCH and control calls with the Execute API:
 
 ```java
+import org.freeswitch.esl.client.dptools.Execute;
 import org.freeswitch.esl.client.outbound.IClientHandler;
 import org.freeswitch.esl.client.outbound.SocketClient;
 import org.freeswitch.esl.client.internal.Context;
+import org.freeswitch.esl.client.transport.event.EslEvent;
 
 import java.net.InetSocketAddress;
 
@@ -263,13 +85,24 @@ public class OutboundExample {
             () -> new IClientHandler() {
                 @Override
                 public void onConnect(Context context, EslEvent event) {
-                    System.out.println("New call connected!");
-                    // Handle the call...
+                    String uuid = event.getEventHeaders().get("Unique-ID");
+                    Execute exe = new Execute(context, uuid);
+
+                    try {
+                        // Blocking calls are safe in virtual threads!
+                        exe.answer();
+                        String digits = exe.playAndGetDigits(3, 10, 3, 10000, "#",
+                            "prompt.wav", "invalid.wav", "^\\d+", 10000);
+                        System.out.println("Collected digits: " + digits);
+                        exe.hangup();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
                 }
 
                 @Override
-                public void onEslEvent(Context context, EslEvent event) {
-                    System.out.println("Event: " + event.getEventName());
+                public void onEslEvent(Context ctx, EslEvent event) {
+                    // Handle events
                 }
             }
         );
@@ -375,14 +208,30 @@ private final ExecutorService eventExecutor =
 1. **Java Version**: Requires Java 21+ (was Java 8)
 2. **SocketClient.start()**: Changed from `startAsync()` to `start()` (removed Guava dependency)
 
+### New Features
+
+**Execute API (Outbound Mode)**
+- `Execute` class with blocking-style dialplan applications
+- `Execute.playAndGetDigits()` - now properly waits for user input completion (uses `event-uuid` mechanism)
+- `Execute.answer()`, `Execute.hangup()`, etc. - all blocking calls safe with Virtual Threads
+- Automatic tracking via `CHANNEL_EXECUTE_COMPLETE` events
+
+**Event Filtering & Optimization**
+- `Client.addEventListener(listener, eventNames...)` - filtered listeners for specific event types
+- `Client.removeEventListener(listener)` - remove specific listeners
+- `Client.setAutoUpdateServerSubscription(boolean)` - automatic server-side subscription optimization
+
+**Automatic Reconnection**
+- `Client.setReconnectable(boolean)` - enable/disable auto-reconnection (enabled by default)
+- `Client.setReconnectionConfig(config)` - customize reconnection behavior
+- Heartbeat monitoring and automatic connection recovery
+- State preservation across reconnections
+
 ### Compatible APIs
 
 All core APIs remain the same:
 - `Client.connect()`
-- `Client.addEventListener()` - now with optional event type filtering
-- `Client.addEventListener(listener, eventNames...)` - new overload for filtered listeners
-- `Client.removeEventListener()` - new method to remove specific listeners
-- `Client.setAutoUpdateServerSubscription(boolean)` - new method for auto-optimization
+- `Client.addEventListener()`
 - `Client.setEventSubscriptions()`
 - All ESL commands and message handling
 

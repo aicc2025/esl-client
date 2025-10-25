@@ -86,6 +86,23 @@ public class Client implements IModEslApi {
 	private boolean autoUpdateServerSubscription = false;
 	private String lastServerSubscription = null;
 
+	// Reconnection support (enabled by default)
+	private boolean reconnectionEnabled = true;
+	private ReconnectionConfig reconnectionConfig = new ReconnectionConfig();
+	private HeartbeatMonitor heartbeatMonitor;
+	private ExponentialBackoffStrategy reconnectStrategy;
+	private ScheduledExecutorService healthCheckExecutor;
+	private ScheduledFuture<?> healthCheckTask;
+	private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+	private final AtomicBoolean connected = new AtomicBoolean(false);
+
+	// Connection parameters (saved for reconnection)
+	private SocketAddress savedAddress;
+	private String savedPassword;
+	private int savedTimeoutSeconds;
+	private volatile String savedEventSubscription;
+	private volatile EventFormat savedEventFormat;
+
 	/**
 	 * Add a global event listener that receives all events.
 	 *
@@ -162,6 +179,71 @@ public class Client implements IModEslApi {
 	}
 
 	/**
+	 * Enable or disable automatic reconnection on connection failure.
+	 * When enabled, the client will monitor HEARTBEAT events and automatically reconnect
+	 * if the connection is lost, using exponential backoff strategy.
+	 *
+	 * @param enable true to enable reconnection (default: true), false to disable
+	 */
+	public void setReconnectable(boolean enable) {
+		this.reconnectionEnabled = enable;
+
+		if (enable && connected.get()) {
+			// If enabling and already connected, start monitoring
+			if (heartbeatMonitor == null) {
+				heartbeatMonitor = new HeartbeatMonitor(reconnectionConfig.getHeartbeatTimeoutMs());
+			}
+			if (reconnectStrategy == null) {
+				reconnectStrategy = ExponentialBackoffStrategy.fromConfig(reconnectionConfig);
+			}
+			startHealthCheck();
+		} else if (!enable) {
+			// If disabling, stop monitoring
+			stopHealthCheck();
+		}
+
+		log.info("Reconnection {}", enable ? "enabled" : "disabled");
+	}
+
+	/**
+	 * Set the reconnection configuration.
+	 * This allows customization of heartbeat timeout, health check interval, and reconnection strategy.
+	 *
+	 * @param config the reconnection configuration
+	 */
+	public void setReconnectionConfig(ReconnectionConfig config) {
+		if (config == null) {
+			throw new IllegalArgumentException("ReconnectionConfig cannot be null");
+		}
+		this.reconnectionConfig = config;
+
+		// Update monitors if already initialized
+		if (heartbeatMonitor != null) {
+			heartbeatMonitor = new HeartbeatMonitor(config.getHeartbeatTimeoutMs());
+		}
+		if (reconnectStrategy != null) {
+			reconnectStrategy = ExponentialBackoffStrategy.fromConfig(config);
+		}
+
+		// Restart health check if running
+		if (healthCheckTask != null && !healthCheckTask.isCancelled()) {
+			stopHealthCheck();
+			startHealthCheck();
+		}
+
+		log.info("Reconnection config updated: {}", config);
+	}
+
+	/**
+	 * Check if the client is currently in reconnection state.
+	 *
+	 * @return true if reconnection is in progress, false otherwise
+	 */
+	public boolean isReconnecting() {
+		return reconnecting.get();
+	}
+
+	/**
 	 * Attempt to establish an authenticated connection to the nominated FreeSWITCH ESL server socket.
 	 * This call will block, waiting for an authentication handshake to occur, or timeout after the
 	 * supplied number of seconds.
@@ -176,56 +258,15 @@ public class Client implements IModEslApi {
 			close();
 		}
 
-		log.info("Connecting to {} ...", clientAddress);
+		// Save connection parameters for reconnection
+		this.savedAddress = clientAddress;
+		this.savedPassword = password;
+		this.savedTimeoutSeconds = timeoutSeconds;
 
+		// Perform initial connection
 		try {
-			// Create socket connection with timeout
-			SocketWrapper socketWrapper = SocketWrapper.connect(clientAddress, timeoutSeconds * 1000);
-			this.socket = Optional.of(socketWrapper);
-
-			log.info("Connected to {}", clientAddress);
-
-			// Create handler
-			InboundClientHandler handler = new InboundClientHandler(password, protocolListener);
-
-			// Create context
-			this.clientContext = Optional.of(new Context(socketWrapper, handler));
-
-			// Start message reader thread (virtual thread)
-			Thread readerThread = Thread.startVirtualThread(() -> messageReaderLoop(socketWrapper, handler));
-			this.messageReaderThread = Optional.of(readerThread);
-
-			// Wait for the authentication handshake to complete
-			long startTime = System.currentTimeMillis();
-			while (!authenticatorResponded.get()) {
-				if (System.currentTimeMillis() - startTime > timeoutSeconds * 1000L) {
-					throw new InboundConnectionFailure("Timeout waiting for authentication response");
-				}
-				try {
-					Thread.sleep(100);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					throw new InboundConnectionFailure("Interrupted while waiting for authentication", e);
-				}
-			}
-
-			if (!authenticated) {
-				throw new InboundConnectionFailure("Authentication failed: " + authenticationResponse.getReplyText());
-			}
-
-			log.info("Authenticated");
-
+			doConnect();
 		} catch (Exception e) {
-			// Cleanup on failure
-			socket.ifPresent(s -> {
-				try {
-					s.close();
-				} catch (Exception ignored) {
-				}
-			});
-			socket = Optional.empty();
-			clientContext = Optional.empty();
-
 			if (e instanceof InboundConnectionFailure) {
 				throw (InboundConnectionFailure) e;
 			}
@@ -313,6 +354,11 @@ public class Client implements IModEslApi {
 	@Override
 	public CommandResponse setEventSubscriptions(EventFormat format, String events) {
 		checkConnected();
+
+		// Save subscription for restoration after reconnection
+		this.savedEventFormat = format;
+		this.savedEventSubscription = events;
+
 		return clientContext.get().setEventSubscriptions(format, events);
 	}
 
@@ -515,6 +561,11 @@ public class Client implements IModEslApi {
 			String channelUuid = event.getEventHeaders().get("Unique-ID");
 			String eventName = event.getEventName();
 
+			// Record heartbeat for reconnection monitoring
+			if ("HEARTBEAT".equals(eventName) && heartbeatMonitor != null) {
+				heartbeatMonitor.recordHeartbeat();
+			}
+
 			for (final FilteredListener fl : eventListeners) {
 				// Check if this listener is interested in this event type
 				if (!fl.matches(eventName)) {
@@ -558,4 +609,231 @@ public class Client implements IModEslApi {
 			log.info("Disconnected ...");
 		}
 	};
+
+	/**
+	 * Initialize reconnection support after successful connection.
+	 * Sets up heartbeat monitoring and health checks.
+	 */
+	private void initializeReconnectionSupport() {
+		if (!reconnectionEnabled) {
+			return;
+		}
+
+		// Initialize heartbeat monitor
+		heartbeatMonitor = new HeartbeatMonitor(reconnectionConfig.getHeartbeatTimeoutMs());
+
+		// Initialize reconnection strategy
+		reconnectStrategy = ExponentialBackoffStrategy.fromConfig(reconnectionConfig);
+
+		// Subscribe to HEARTBEAT events for monitoring
+		try {
+			clientContext.ifPresent(ctx -> ctx.sendCommand("event plain HEARTBEAT"));
+			log.debug("Subscribed to HEARTBEAT for reconnection monitoring");
+		} catch (Exception e) {
+			log.warn("Failed to subscribe to HEARTBEAT events", e);
+		}
+
+		// Record initial heartbeat to avoid false timeout
+		heartbeatMonitor.reset();
+
+		log.debug("Reconnection support initialized");
+
+		// Start health check
+		startHealthCheck();
+
+		// Set connected flag
+		connected.set(true);
+
+		log.info("Client connected to {}", savedAddress);
+	}
+
+	/**
+	 * Start the periodic health check task.
+	 */
+	private void startHealthCheck() {
+		if (healthCheckExecutor == null) {
+			healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+				Thread t = Thread.ofVirtual().unstarted(r);
+				t.setName("health-check");
+				return t;
+			});
+		}
+
+		healthCheckTask = healthCheckExecutor.scheduleAtFixedRate(
+			this::performHealthCheck,
+			reconnectionConfig.getHealthCheckIntervalMs(),
+			reconnectionConfig.getHealthCheckIntervalMs(),
+			TimeUnit.MILLISECONDS
+		);
+
+		log.debug("Health check started with interval: {}ms", reconnectionConfig.getHealthCheckIntervalMs());
+	}
+
+	/**
+	 * Stop the health check task.
+	 */
+	private void stopHealthCheck() {
+		if (healthCheckTask != null) {
+			healthCheckTask.cancel(false);
+			healthCheckTask = null;
+		}
+
+		if (healthCheckExecutor != null) {
+			healthCheckExecutor.shutdown();
+			healthCheckExecutor = null;
+		}
+	}
+
+	/**
+	 * Perform a health check - called periodically by the health check task.
+	 * Checks for heartbeat timeout and triggers reconnection if needed.
+	 */
+	private void performHealthCheck() {
+		if (heartbeatMonitor == null || !connected.get()) {
+			return;
+		}
+
+		if (heartbeatMonitor.isTimeout()) {
+			long elapsed = heartbeatMonitor.getTimeSinceLastHeartbeat();
+			log.warn("Heartbeat timeout detected after {}ms, triggering reconnection", elapsed);
+			connected.set(false);
+			attemptReconnection();
+		}
+	}
+
+	/**
+	 * Attempt to reconnect with exponential backoff.
+	 * Runs in a separate virtual thread.
+	 */
+	private void attemptReconnection() {
+		if (!reconnecting.compareAndSet(false, true)) {
+			log.debug("Reconnection already in progress, skipping");
+			return;
+		}
+
+		log.info("Starting reconnection process");
+
+		Thread.startVirtualThread(() -> {
+			while (reconnectionEnabled && reconnecting.get()) {
+				try {
+					// Clean up old connection
+					try {
+						closeConnection();
+					} catch (Exception e) {
+						log.debug("Error closing old connection", e);
+					}
+
+					// Calculate delay with exponential backoff
+					long delay = reconnectStrategy.nextDelay();
+					log.info("Waiting {}ms before reconnection attempt {} ...",
+							delay, reconnectStrategy.getAttemptCount());
+					Thread.sleep(delay);
+
+					// Attempt reconnection
+					doConnect();
+
+					// Success
+					log.info("Reconnection successful after {} attempts", reconnectStrategy.getAttemptCount());
+					reconnectStrategy.reset();
+					reconnecting.set(false);
+					connected.set(true);
+
+					if (heartbeatMonitor != null) {
+						heartbeatMonitor.reset();
+					}
+
+					// Exit the reconnection loop
+					break;
+
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					log.warn("Reconnection interrupted");
+					reconnecting.set(false);
+					break;
+				} catch (Exception e) {
+					log.error("Reconnection attempt {} failed: {}",
+							reconnectStrategy.getAttemptCount(), e.getMessage());
+					// Continue loop to retry
+				}
+			}
+		});
+	}
+
+	/**
+	 * Close the current connection cleanly.
+	 */
+	private void closeConnection() {
+		// Interrupt reader thread
+		messageReaderThread.ifPresent(Thread::interrupt);
+
+		// Close socket
+		socket.ifPresent(s -> {
+			try {
+				s.close();
+			} catch (Exception e) {
+				log.warn("Error closing socket", e);
+			}
+		});
+
+		// Clear state
+		socket = Optional.empty();
+		clientContext = Optional.empty();
+		messageReaderThread = Optional.empty();
+	}
+
+	/**
+	 * Internal connection method used by connect() and reconnection logic.
+	 */
+	private void doConnect() throws Exception {
+		log.info("Connecting to {} ...", savedAddress);
+
+		// Create socket connection with timeout
+		SocketWrapper socketWrapper = SocketWrapper.connect(savedAddress, savedTimeoutSeconds * 1000);
+		this.socket = Optional.of(socketWrapper);
+
+		log.info("Connected to {}", savedAddress);
+
+		// Create handler
+		InboundClientHandler handler = new InboundClientHandler(savedPassword, protocolListener);
+
+		// Create context
+		this.clientContext = Optional.of(new Context(socketWrapper, handler));
+
+		// Reset authentication state
+		authenticated = false;
+		authenticatorResponded.set(false);
+
+		// Start message reader thread (virtual thread)
+		Thread readerThread = Thread.startVirtualThread(() -> messageReaderLoop(socketWrapper, handler));
+		this.messageReaderThread = Optional.of(readerThread);
+
+		// Wait for the authentication handshake to complete
+		long startTime = System.currentTimeMillis();
+		while (!authenticatorResponded.get()) {
+			if (System.currentTimeMillis() - startTime > savedTimeoutSeconds * 1000L) {
+				throw new InboundConnectionFailure("Timeout waiting for authentication response");
+			}
+			try {
+				Thread.sleep(100);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new InboundConnectionFailure("Interrupted while waiting for authentication", e);
+			}
+		}
+
+		if (!authenticated) {
+			throw new InboundConnectionFailure("Authentication failed: " + authenticationResponse.getReplyText());
+		}
+
+		log.info("Authenticated");
+
+		// Restore event subscriptions
+		if (savedEventSubscription != null && savedEventFormat != null) {
+			setEventSubscriptions(savedEventFormat, savedEventSubscription);
+			log.debug("Restored event subscriptions: {}", savedEventSubscription);
+		}
+
+		// Reinitialize reconnection support
+		initializeReconnectionSupport();
+	}
 }

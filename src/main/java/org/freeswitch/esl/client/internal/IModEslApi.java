@@ -71,4 +71,16 @@ public interface IModEslApi {
 	CommandResponse setLoggingLevel(LoggingLevel level);
 
 	CommandResponse cancelLogging();
+
+	/**
+	 * Wait for CHANNEL_EXECUTE_COMPLETE event with the given Application-UUID.
+	 * This is used by blocking-style Execute API calls to wait for command completion.
+	 * Only available in outbound mode.
+	 *
+	 * @param appUuid the Application-UUID (event-uuid) to wait for
+	 * @return a CompletableFuture that completes with the CHANNEL_EXECUTE_COMPLETE event
+	 */
+	default CompletableFuture<EslEvent> waitForExecuteComplete(String appUuid) {
+		throw new UnsupportedOperationException("waitForExecuteComplete is only supported in outbound mode");
+	}
 }

@@ -239,4 +239,16 @@ public abstract class AbstractEslClientHandler {
 
 	protected abstract void handleDisconnectionNotice();
 
+	/**
+	 * Wait for CHANNEL_EXECUTE_COMPLETE event with the given Application-UUID.
+	 * Default implementation throws UnsupportedOperationException.
+	 * Subclasses (like OutboundClientHandler) can override to provide actual implementation.
+	 *
+	 * @param appUuid the Application-UUID (event-uuid) to wait for
+	 * @return a CompletableFuture that completes with the CHANNEL_EXECUTE_COMPLETE event
+	 */
+	public CompletableFuture<EslEvent> waitForExecuteComplete(String appUuid) {
+		throw new UnsupportedOperationException("waitForExecuteComplete is only supported in outbound mode");
+	}
+
 }

@@ -5,6 +5,7 @@ import java.util.UUID;
 import org.freeswitch.esl.client.internal.IModEslApi;
 import org.freeswitch.esl.client.transport.CommandResponse;
 import org.freeswitch.esl.client.transport.SendMsg;
+import org.freeswitch.esl.client.transport.event.EslEvent;
 import org.freeswitch.esl.client.transport.message.EslMessage;
 
 public class Execute {
@@ -896,7 +897,8 @@ public class Execute {
 
     /**
      * Play a prompt and get digits.
-     * 
+     * This method blocks until the user provides input or timeout occurs.
+     *
      * @return collected digits or null if none
      *
      * @see <a href="http://wiki.freeswitch.org/wiki/Misc._Dialplan_Tools_play_and_get_digits">
@@ -909,7 +911,8 @@ public class Execute {
 
         String id = UUID.randomUUID().toString();
 
-        CommandResponse resp = sendExeMesg("play_and_get_digits",
+        // Send command and wait for completion
+        sendExeMesgAndWait("play_and_get_digits",
                 String.valueOf(min)
                         + " " + max
                         + " " + tries
@@ -921,14 +924,11 @@ public class Execute {
                         + " " + regexp
                         + " " + digitTimeout);
 
-        if (resp.isOk()) {
-            EslMessage eslMessage = api.sendApiCommand("uuid_getvar", _uuid
-                    + " " + id);
-            if (eslMessage.getBodyLines().size() > 0)
-                return eslMessage.getBodyLines().get(0);
-        } else {
-            throw new ExecuteException(resp.getReplyText());
-        }
+        // Now read the variable (it should be set after completion)
+        EslMessage eslMessage = api.sendApiCommand("uuid_getvar", _uuid + " " + id);
+        if (eslMessage.getBodyLines().size() > 0)
+            return eslMessage.getBodyLines().get(0);
+
         return null;
     }
 
@@ -1702,8 +1702,52 @@ public class Execute {
         else
             return resp;
     }
-    
-    
+
+    /**
+     * Send execute message and wait for CHANNEL_EXECUTE_COMPLETE event.
+     * This method blocks until the application completes execution.
+     * Used for applications that need to wait for completion (playAndGetDigits, read, etc.)
+     *
+     * @param app the application name
+     * @param args the application arguments
+     * @return the CHANNEL_EXECUTE_COMPLETE event
+     * @throws ExecuteException if the command fails
+     */
+    private EslEvent sendExeMesgAndWait(String app, String args) throws ExecuteException {
+        // Generate a UUID for tracking this execute command
+        String eventUuid = UUID.randomUUID().toString();
+
+        // Build SendMsg with channel UUID and event-uuid header
+        // Using channel UUID in SendMsg is required for event-uuid to work
+        SendMsg msg = new SendMsg(_uuid);
+        msg.addCallCommand("execute");
+        msg.addExecuteAppName(app);
+        if (nn(args))
+            msg.addExecuteAppArg(args);
+        msg.addEventUuid(eventUuid);
+
+        // Register listener BEFORE sending the command
+        java.util.concurrent.CompletableFuture<org.freeswitch.esl.client.transport.event.EslEvent> future =
+                api.waitForExecuteComplete(eventUuid);
+
+        // Send the command
+        CommandResponse resp = api.sendMessage(msg);
+        if (!resp.isOk()) {
+            throw new ExecuteException(resp.getReplyText());
+        }
+
+        // Wait for CHANNEL_EXECUTE_COMPLETE event
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ExecuteException("Interrupted while waiting for execute completion", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new ExecuteException("Error waiting for execute completion: " + e.getMessage(), e);
+        }
+    }
+
+
     private boolean nn(Object obj) {return obj != null;}
 
 }

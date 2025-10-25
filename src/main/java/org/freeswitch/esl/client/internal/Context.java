@@ -285,4 +285,16 @@ public class Context implements IModEslApi {
 			throw propagate(t);
 		}
 	}
+
+	/**
+	 * Wait for CHANNEL_EXECUTE_COMPLETE event with the given Application-UUID.
+	 * This delegates to the handler, which may support this feature (outbound mode).
+	 *
+	 * @param appUuid the Application-UUID (event-uuid) to wait for
+	 * @return a CompletableFuture that completes with the CHANNEL_EXECUTE_COMPLETE event
+	 */
+	@Override
+	public CompletableFuture<EslEvent> waitForExecuteComplete(String appUuid) {
+		return handler.waitForExecuteComplete(appUuid);
+	}
 }

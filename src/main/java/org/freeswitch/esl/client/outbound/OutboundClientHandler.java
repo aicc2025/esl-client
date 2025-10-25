@@ -21,8 +21,11 @@ import org.freeswitch.esl.client.transport.event.EslEvent;
 import org.freeswitch.esl.client.transport.message.EslMessage;
 import org.freeswitch.esl.client.transport.socket.SocketWrapper;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.Map;
 
 /**
  * Specialized {@link AbstractEslClientHandler} that implements the base connection logic for an
@@ -39,6 +42,8 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 	private final IClientHandler clientHandler;
 	// Single-threaded virtual thread executor for this connection to ensure event ordering
 	private final ExecutorService eventExecutor;
+	// Map to track pending execute completions: key is Application-UUID, value is CompletableFuture
+	private final Map<String, CompletableFuture<EslEvent>> pendingExecutions = new ConcurrentHashMap<>();
 
 	public OutboundClientHandler(IClientHandler clientHandler, ExecutorService callbackExecutor) {
 		this.clientHandler = clientHandler;
@@ -49,15 +54,30 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 	/**
 	 * Called when a new connection is established.
 	 * Sends 'connect' command to FreeSWITCH server.
+	 * The onConnect callback is executed in a virtual thread to allow blocking calls.
 	 */
 	public void onConnectionEstablished(final SocketWrapper socket) {
 		// Have received a connection from FreeSWITCH server, send connect response
 		log.debug("Received new connection from server, sending connect message");
 
 		sendApiSingleLineCommand(socket, "connect")
-				.thenAccept(response -> clientHandler.onConnect(
-						new Context(socket, OutboundClientHandler.this),
-						new EslEvent(response, true)))
+				.thenAccept(response -> {
+					// Execute onConnect in a virtual thread to allow blocking calls
+					// This enables user code to use Execute API (answer(), playAndGetDigits(), etc.) directly
+					Thread.startVirtualThread(() -> {
+						try {
+							clientHandler.onConnect(
+									new Context(socket, OutboundClientHandler.this),
+									new EslEvent(response, true));
+						} catch (Exception e) {
+							log.error("Error in onConnect callback", e);
+							try {
+								socket.close();
+							} catch (Exception ignored) {
+							}
+						}
+					});
+				})
 				.exceptionally(throwable -> {
 					try {
 						socket.close();
@@ -71,8 +91,22 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 	@Override
 	protected void handleEslEvent(final SocketWrapper socket, final EslEvent event) {
 		// Use single-threaded executor to ensure events are processed in order
-		eventExecutor.execute(() -> clientHandler.onEslEvent(
-				new Context(socket, OutboundClientHandler.this), event));
+		eventExecutor.execute(() -> {
+			// First, check if anyone is waiting for this event
+			if ("CHANNEL_EXECUTE_COMPLETE".equals(event.getEventName())) {
+				String appUuid = event.getEventHeaders().get("Application-UUID");
+				if (appUuid != null) {
+					CompletableFuture<EslEvent> future = pendingExecutions.remove(appUuid);
+					if (future != null) {
+						future.complete(event);
+					}
+				}
+			}
+
+			// Then deliver to user handler
+			clientHandler.onEslEvent(
+					new Context(socket, OutboundClientHandler.this), event);
+		});
 	}
 
 	@Override
@@ -87,11 +121,29 @@ class OutboundClientHandler extends AbstractEslClientHandler {
 	}
 
 	/**
+	 * Register a listener for CHANNEL_EXECUTE_COMPLETE event with the given Application-UUID.
+	 * This allows blocking-style Execute API calls to wait for command completion.
+	 *
+	 * @param appUuid the Application-UUID to wait for
+	 * @return a CompletableFuture that will be completed when the CHANNEL_EXECUTE_COMPLETE event arrives
+	 */
+	@Override
+	public CompletableFuture<EslEvent> waitForExecuteComplete(String appUuid) {
+		CompletableFuture<EslEvent> future = new CompletableFuture<>();
+		pendingExecutions.put(appUuid, future);
+		return future;
+	}
+
+	/**
 	 * Shutdown the event executor to release resources.
 	 * Should be called when the connection is closed.
 	 */
 	public void shutdown() {
 		log.debug("Shutting down event executor");
+		// Complete all pending futures with exception
+		pendingExecutions.values().forEach(future ->
+				future.completeExceptionally(new RuntimeException("Connection closed")));
+		pendingExecutions.clear();
 		eventExecutor.shutdown();
 	}
 }

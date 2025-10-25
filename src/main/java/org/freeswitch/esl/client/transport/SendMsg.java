@@ -131,6 +131,19 @@ public class SendMsg {
 	}
 
 	/**
+	 * Adds the following line to the message:
+	 * <pre>
+	 *   event-uuid: uuid
+	 * </pre>
+	 *
+	 * @param uuid the UUID to use as Application-UUID for tracking execution completion
+	 */
+	public SendMsg addEventUuid(String uuid) {
+		msgLines.add("event-uuid: " + uuid);
+		return this;
+	}
+
+	/**
 	 * A generic method to add a message line. The constructed line in the sent message will be in the
 	 * form:
 	 * <pre>
