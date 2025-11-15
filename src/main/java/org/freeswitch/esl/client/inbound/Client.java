@@ -775,6 +775,10 @@ public class Client implements IModEslApi {
 			}
 		});
 
+		// Shutdown all channel executors
+		channelExecutors.values().forEach(ExecutorService::shutdown);
+		channelExecutors.clear();
+
 		// Clear state
 		socket = Optional.empty();
 		clientContext = Optional.empty();

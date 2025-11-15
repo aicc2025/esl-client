@@ -51,3 +51,18 @@ task runOutboundExecuteTest(type: JavaExec) {
     mainClass = 'OutboundExecuteTest'
     standardInput = System.in
 }
+
+task runExecutorCleanupTest(type: JavaExec) {
+    description = 'Run executor cleanup manual test'
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'ExecutorCleanupManualTest'
+    standardInput = System.in
+}
+
+task createTestCall(type: JavaExec) {
+    description = 'Create a test call to trigger channel events'
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'CreateTestCallManual'
+}
